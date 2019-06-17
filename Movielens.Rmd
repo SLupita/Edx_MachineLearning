@@ -1,0 +1,307 @@
+---
+title: "MovieLens"
+author: "Lupita Sahu"
+date: "17 June 2019"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, cache=TRUE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Overview
+Recommendation systems use ratings that users have given items to make specific recommendations. Netflix uses a recommendation system to predict how many stars a user will give a specific movie. One star suggests it is not a good movie, whereas five stars suggests it is an excellent movie. Here, we will build a prediction algorithm that can reduce the RMSE to be below 87%.
+
+## Data loading
+
+```{r data}
+library(tidyverse)
+library(caret)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))), col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+     semi_join(edx, by = "movieId") %>%
+     semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+## Exploratory data analysis
+
+Let's look at how the data looks
+
+```{r data1}
+edx %>% as_tibble()
+```
+
+We can group into the total number of unique users and total number of unique movies.
+
+```{r summarize}
+edx %>% summarize(n_users = n_distinct(userId), n_movies = n_distinct(movieId))
+```
+
+We can see that not every user reviewed every movie. The prediction algorithm in a way fills the ratings for each user for each movie.
+
+Let's look at how the movies are rated. It looks like some movies are rated more frequently than others. Likewise some users are more active at rating movies than others.
+
+```{r analysis}
+edx %>% group_by(movieId) %>% summarise(n=n(), title=first(title)) %>% ggplot(aes(n)) + geom_bar(stat="count")
+
+edx %>% group_by(userId) %>% summarise(n=n(), title=first(title)) %>% ggplot(aes(n)) + geom_bar(stat="count")
+
+```
+
+Let's look at average rating given by users who have rated more than 100 movies. We see that some users are generous while other are not.
+
+```{r}
+edx %>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating)) %>% 
+  filter(n()>=100) %>%
+  ggplot(aes(b_u)) + 
+  geom_histogram(bins = 30, color = "black")
+```
+
+## Preprocessing
+We will partition the edx data into train and test data sets with 90%-10% split.
+
+```{r esample_data}
+set.seed(135)
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+train <- edx[-test_index,]
+temp <- edx[test_index,]
+
+test <- temp %>% 
+    semi_join(train, by = "movieId") %>%
+    semi_join(train, by = "userId")
+
+## take observations removed from test and add to train
+removed <- anti_join(temp, test)
+train <- rbind(train, removed)
+rm(temp)
+```
+
+## Modelling
+
+Let's assume all movies have same ratings and calculate the RMSE
+
+```{r modelling}
+#Calculate the mean rating
+mu <- mean(train$rating)
+
+# calculate RMSE for naive model of predicting muHat
+naiveRmse <- RMSE(test$rating, mu)
+naiveRmse
+```
+
+RMSE of 1.06 can be improved after adding movie effect and user effect. After adding the movie bias RMSE can be calculated as follows.
+
+```{r movie_bias}
+movie_avgs <- train %>% group_by(movieId) %>% summarize(b_i = mean(rating - mu))
+
+predicted_ratings <- mu + test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  pull(b_i)
+
+model1_rmse <- RMSE(predicted_ratings, test$rating)
+model1_rmse
+```
+
+RMSE is better now at a value of 0.94. Let's calculate RMSE after consider user bias as follows:
+
+```{r user_bias}
+user_avgs <- train %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+model2_rmse <- RMSE(predicted_ratings, test$rating)
+model2_rmse
+```
+
+RMSE is now .87 which is much better. 
+However we can still improve out model. Here are the movies with highest residuals:
+```{r mistake}
+test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  mutate(residual = rating - (mu + b_i)) %>%
+  arrange(desc(abs(residual))) %>% 
+  select(title,  residual) %>% slice(1:10)
+```
+
+Here are the 10 best and 10 worst movies as per our estimate.
+```{r}
+##Creating a dataset comtaining movie ID and titles only
+movie_titles <- edx %>% 
+  select(movieId, title) %>%
+  distinct()
+
+movie_avgs %>% left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i) %>% 
+  slice(1:10) 
+
+movie_avgs %>% left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i) %>% 
+  slice(1:10) 
+
+```
+
+If we see how often they were rated, almost all of them look biased with only few ratings.
+
+```{r}
+## 10 best movies
+train %>% count(movieId) %>% 
+  left_join(movie_avgs) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) 
+
+## 10 worst movies
+train %>% count(movieId) %>% 
+  left_join(movie_avgs) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10)
+```
+
+This is why we will look at regularization, where we penalize large estimates that are formed using small sample sizes
+
+## penealized least squares approach
+
+```{r tuning}
+lambdas <- seq(0, 10, 0.25)
+
+just_the_sum <- train %>% 
+  group_by(movieId) %>% 
+  summarize(s = sum(rating - mu), n_i = n())
+
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- test %>% 
+    left_join(just_the_sum, by='movieId') %>% 
+    mutate(b_i = s/(n_i+l)) %>%
+    mutate(pred = mu + b_i) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, test$rating))
+})
+
+qplot(lambdas, rmses)  
+lambda <- lambdas[which.min(rmses)]
+lambda
+```
+
+lambda is a tuning parameter which is set to be 1.75. We'll calculate RMSE using penalized regularization using this value.
+
+```{r regularization}
+movie_reg_avgs <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+predicted_ratings <- test %>% 
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+
+model3_rmse <- RMSE(predicted_ratings, test$rating)
+model3_rmse
+```
+
+After tuning the value of lambda on train data set we will use cross-validation on test set to find the final value of lambda
+
+```{r final}
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+
+  mu <- mean(train$rating)
+  
+  b_i <- train %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- train %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+
+  predicted_ratings <- 
+    test %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  
+    return(RMSE(predicted_ratings, test$rating))
+})
+
+qplot(lambdas, rmses)
+lambda <- lambdas[which.min(rmses)]
+lambda
+min(rmses)
+```
+
+RMSE is now 0.86 with a lambda value of 4.75.
+
+## Results
+We will now use the final model to calculate RMSE on the validation data set.
+
+```{r validation}
+b_i <- train %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+lambda))
+  
+  b_u <- train %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+
+final_predicted_ratings <- 
+    validation %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  
+final_rmse <- RMSE(final_predicted_ratings, validation$rating)
+```
+
+## Conclusion
+The final model accounting for regularized movie bias and regularized user bias yielded an RMSE of `r final_rmse`.
